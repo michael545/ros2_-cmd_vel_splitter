@@ -1,0 +1,7 @@
+cmd_vel_splitter:
+  ros__parameters:
+    input_topic: /cmd_vel
+    output_topics:
+      - /mcb7/cmd_vel
+      - /mcb31/cmd_vel
+    queue_depth: 10

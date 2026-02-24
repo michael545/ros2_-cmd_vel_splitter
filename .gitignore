@@ -1,0 +1,23 @@
+# ROS 2 colcon build artifacts
+build/
+install/
+log/
+
+# Python cache and virtual envs
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env/
+
+.vscode/
+.idea/
+
+# Misc
+.DS_Store
+Thumbs.db
+
+# Pre-existing reference docs (not tracked in this repo)
+onAI_PRODUCTIVITY_and_AI_SLOP.md
+onREADMEs.md
+onROSSYSTEMS.md
