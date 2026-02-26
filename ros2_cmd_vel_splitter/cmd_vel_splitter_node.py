@@ -3,165 +3,66 @@ from geometry_msgs.msg import Twist
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-from rclpy.publisher import Publisher
 from rclpy.qos import QoSProfile
-from typing import List
+
+_VALIDATORS = {
+    'input_topic': (Parameter.Type.STRING, lambda v: bool(v), 'must be a non-empty string'),
+    'output_topics': (Parameter.Type.STRING_ARRAY, lambda v: v and all(v), 'must be a non-empty list of non-empty strings'),
+    'queue_depth': (Parameter.Type.INTEGER, lambda v: v >= 1, 'must be an integer >= 1'),
+}
 
 
 class CmdVelSplitter(Node):
     def __init__(self) -> None:
         super().__init__('cmd_vel_splitter')
-
         self.declare_parameter('input_topic', '/cmd_vel')
         self.declare_parameter('output_topics', ['/mcb7/cmd_vel', '/mcb31/cmd_vel'])
         self.declare_parameter('queue_depth', 10)
+        self._sub = None
+        self._pubs = []
+        self._apply(self._cfg(), initial=True)
+        self.add_on_set_parameters_callback(self._on_params)
 
-        self._input_topic = self.get_parameter('input_topic').get_parameter_value().string_value
-        self._output_topics = list(
-            self.get_parameter('output_topics').get_parameter_value().string_array_value
-        )
-        self._queue_depth = int(
-            self.get_parameter('queue_depth').get_parameter_value().integer_value
-        )
+    def _cfg(self):
+        g = self.get_parameter
+        return g('input_topic').value, list(g('output_topics').value), int(g('queue_depth').value)
 
-        self._qos_profile = QoSProfile(depth=self._queue_depth)
-        self._subscription = None
-        self._publishers: List[Publisher] = []
+    def _apply(self, cfg, initial=False):
+        inp, outs, depth = cfg
+        for p in self._pubs:
+            self.destroy_publisher(p)
+        if self._sub:
+            self.destroy_subscription(self._sub)
+        qos = QoSProfile(depth=depth)
+        self._sub = self.create_subscription(Twist, inp, self._cb, qos)
+        self._pubs = [self.create_publisher(Twist, t, qos) for t in outs]
+        self._cfg_cache = cfg
+        label = "Startup" if initial else "Updated"
+        self.get_logger().info(f"{label}: input='{inp}', outputs={outs}, queue_depth={depth}")
 
-        self._apply_configuration(
-            input_topic=self._input_topic,
-            output_topics=self._output_topics,
-            queue_depth=self._queue_depth,
-            initial=True,
-        )
-
-        self.add_on_set_parameters_callback(self._on_parameters_changed)
-
-    def _apply_configuration(
-        self,
-        *,
-        input_topic: str,
-        output_topics: List[str],
-        queue_depth: int,
-        initial: bool = False,
-    ) -> None:
-        """Update subscription and publishers after parameter changes."""
-        if not input_topic:
-            raise ValueError('input_topic cannot be empty')
-        if not output_topics:
-            raise ValueError('output_topics must contain at least one topic')
-        if queue_depth < 1:
-            raise ValueError('queue_depth must be >= 1')
-
-        for publisher in self._publishers:
-            self.destroy_publisher(publisher)
-        if self._subscription is not None:
-            self.destroy_subscription(self._subscription)
-
-        self._qos_profile = QoSProfile(depth=queue_depth)
-
-        self._subscription = self.create_subscription(
-            Twist,
-            input_topic,
-            self._cmd_vel_callback,
-            self._qos_profile,
-        )
-
-        self._publishers = [
-            self.create_publisher(Twist, topic, self._qos_profile)
-            for topic in output_topics
-        ]
-
-        self._input_topic = input_topic
-        self._output_topics = output_topics
-        self._queue_depth = queue_depth
-
-        if initial:
-            self.get_logger().info(
-                f"Startup: listening on '{self._input_topic}', republishing to {self._output_topics}"
-            )
-        else:
-            self.get_logger().info(
-                f"Updated: input='{self._input_topic}', outputs={self._output_topics}, queue_depth={self._queue_depth}"
-            )
-
-    def _on_parameters_changed(self, params: List[Parameter]) -> SetParametersResult:
-        next_input = self._input_topic
-        next_outputs = list(self._output_topics)
-        next_depth = self._queue_depth
-
-        for param in params:
-            if param.name == 'input_topic':
-                if param.type_ != Parameter.Type.STRING:
-                    return SetParametersResult(
-                        successful=False,
-                        reason='input_topic must be a string',
-                    )
-                if not param.value:
-                    return SetParametersResult(
-                        successful=False,
-                        reason='input_topic cannot be empty',
-                    )
-                next_input = param.value
-
-            elif param.name == 'output_topics':
-                if param.type_ != Parameter.Type.STRING_ARRAY:
-                    return SetParametersResult(
-                        successful=False,
-                        reason='output_topics must be a list of strings',
-                    )
-                if not param.value:
-                    return SetParametersResult(
-                        successful=False,
-                        reason='output_topics must contain at least one topic',
-                    )
-                if any(not topic for topic in param.value):
-                    return SetParametersResult(
-                        successful=False,
-                        reason='output_topics entries must be non-empty',
-                    )
-                next_outputs = list(param.value)
-
-            elif param.name == 'queue_depth':
-                if param.type_ != Parameter.Type.INTEGER:
-                    return SetParametersResult(
-                        successful=False,
-                        reason='queue_depth must be an integer',
-                    )
-                if param.value < 1:
-                    return SetParametersResult(
-                        successful=False,
-                        reason='queue_depth must be >= 1',
-                    )
-                next_depth = int(param.value)
-
-        config_changed = (
-            next_input != self._input_topic
-            or next_outputs != self._output_topics
-            or next_depth != self._queue_depth
-        )
-
-        if config_changed:
-            try:
-                self._apply_configuration(
-                    input_topic=next_input,
-                    output_topics=next_outputs,
-                    queue_depth=next_depth,
-                )
-            except ValueError as error:
-                return SetParametersResult(
-                    successful=False,
-                    reason=str(error),
-                )
-
+    def _on_params(self, params):
+        inp, outs, depth = self._cfg_cache
+        mapping = {'input_topic': lambda v: (v, outs, depth),
+                   'output_topics': lambda v: (inp, list(v), depth),
+                   'queue_depth': lambda v: (inp, outs, int(v))}
+        for p in params:
+            if p.name in _VALIDATORS:
+                typ, check, reason = _VALIDATORS[p.name]
+                if p.type_ != typ or not check(p.value):
+                    return SetParametersResult(successful=False, reason=f'{p.name} {reason}')
+            if p.name in mapping:
+                inp, outs, depth = mapping[p.name](p.value)
+        new_cfg = (inp, outs, depth)
+        if new_cfg != self._cfg_cache:
+            self._apply(new_cfg)
         return SetParametersResult(successful=True)
 
-    def _cmd_vel_callback(self, msg: Twist) -> None:
-        for publisher in self._publishers:
-            publisher.publish(msg)
+    def _cb(self, msg):
+        for p in self._pubs:
+            p.publish(msg)
 
 
-def main(args=None) -> None:
+def main(args=None):
     rclpy.init(args=args)
     node = CmdVelSplitter()
     try:
